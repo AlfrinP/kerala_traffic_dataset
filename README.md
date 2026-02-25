@@ -7,29 +7,53 @@ for 20 Kerala locations. Runs as a cron job every hour, storing results in Postg
 
 1. Get a free TomTom API key at [developer.tomtom.com](https://developer.tomtom.com) (2,500 requests/day).
 
-2. Create a venv and install deps:
+2. Copy `.env.example` to `.env` and fill in your values:
+   ```
+   TOMTOM_API_KEY=your-tomtom-api-key
+   COLLECTOR_DATABASE_URL=postgresql://user:password@localhost:5432/smartmap
+   ```
+
+3. Make sure PostgreSQL is running and the database exists:
+   ```bash
+   createdb smartmap  # if not already created
+   ```
+
+### Docker (recommended for VPS)
+
+4. Build the image:
+   ```bash
+   docker compose build
+   ```
+
+5. Test it manually:
+   ```bash
+   docker compose run --rm collector
+   ```
+   You should see: `Collected 380 rows, 0 batch errors`
+
+6. Set up the cron job (runs every hour):
+   ```bash
+   crontab -e
+   ```
+   Add this line (adjust path):
+   ```
+   0 * * * * cd /path/to/kerala_traffic_dataset && docker compose run --rm collector >> cron.log 2>&1
+   ```
+
+### Without Docker
+
+4. Create a venv and install deps:
    ```bash
    python3 -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. Copy `.env.example` to `.env` and fill in your values:
-   ```
-   TOMTOM_API_KEY=your-tomtom-api-key
-   COLLECTOR_DATABASE_URL=postgresql://user:password@localhost:5432/smartmap
-   ```
-
-4. Make sure PostgreSQL is running and the database exists:
-   ```bash
-   createdb smartmap  # if not already created
-   ```
-
 5. Test it manually:
    ```bash
    python collect.py
    ```
-   You should see: `Collected 380 rows`
+   You should see: `Collected 380 rows, 0 batch errors`
 
 6. Set up the cron job (runs every hour):
    ```bash
@@ -37,10 +61,12 @@ for 20 Kerala locations. Runs as a cron job every hour, storing results in Postg
    ```
    Add this line (adjust paths):
    ```
-   0 * * * * cd /path/to/kerala_traffic_dataset && /path/to/kerala_traffic_dataset/.venv/bin/python collect.py >> cron.log 2>&1
+   0 * * * * cd /path/to/kerala_traffic_dataset && .venv/bin/python collect.py >> cron.log 2>&1
    ```
 
-7. Verify cron is running:
+### Verify
+
+7. Check that cron is running:
    ```bash
    tail -f cron.log
    ```

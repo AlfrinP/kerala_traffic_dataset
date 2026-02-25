@@ -1,15 +1,16 @@
 """
-Google Maps Distance Matrix data collector for Kerala traffic patterns.
+TomTom Matrix Routing data collector for Kerala traffic patterns.
 
-Queries all pairs of Kerala locations and records travel times with traffic
-into a PostgreSQL database. Designed to run as a cron job every hour.
+Queries all pairs of Kerala locations via the TomTom Matrix Routing v2 API
+and records travel distances and durations (with live traffic) into a
+PostgreSQL database. Designed to run as a cron job every hour.
 
 Usage:
-    python -m data_collection.collect
+    python collect.py
 
 Requires in .env:
-    GOOGLE_MAPS_API_KEY
-    COLLECTOR_DATABASE_URL  (e.g. postgresql://user:pass@localhost:5432/smartmap)
+    TOMTOM_API_KEY         (free at developer.tomtom.com — 2,500 req/day)
+    COLLECTOR_DATABASE_URL (e.g. postgresql://user:pass@localhost:5432/smartmap)
 """
 
 import os
@@ -21,14 +22,15 @@ import httpx
 import psycopg2
 from dotenv import load_dotenv
 
-from data_collection.locations import KERALA_LOCATIONS
+from locations import KERALA_LOCATIONS
 
 load_dotenv()
 
-API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+API_KEY = os.getenv("TOMTOM_API_KEY", "")
 DATABASE_URL = os.getenv("COLLECTOR_DATABASE_URL", "")
-BASE_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
-BATCH_SIZE = 10
+MATRIX_URL = "https://api.tomtom.com/routing/matrix/2"
+# Free tier max matrix size is 100 cells; 5 origins x 20 destinations = 100
+BATCH_SIZE = 5
 
 
 CREATE_TABLE_SQL = """
@@ -70,26 +72,77 @@ def ensure_table(conn):
 
 
 def query_batch(origins: list[dict], destinations: list[dict]) -> dict:
-    origin_str = "|".join(f"{loc['lat']},{loc['lng']}" for loc in origins)
-    dest_str = "|".join(f"{loc['lat']},{loc['lng']}" for loc in destinations)
-
-    params = {
-        "origins": origin_str,
-        "destinations": dest_str,
-        "key": API_KEY,
-        "departure_time": "now",
-        "traffic_model": "best_guess",
+    body = {
+        "origins": [
+            {"point": {"latitude": loc["lat"], "longitude": loc["lng"]}}
+            for loc in origins
+        ],
+        "destinations": [
+            {"point": {"latitude": loc["lat"], "longitude": loc["lng"]}}
+            for loc in destinations
+        ],
+        "options": {
+            "departAt": "now",
+            "traffic": "live",
+            "travelMode": "car",
+            "routeType": "fastest",
+        },
     }
 
-    with httpx.Client(timeout=30) as client:
-        resp = client.get(BASE_URL, params=params)
+    with httpx.Client(timeout=120) as client:
+        resp = client.post(
+            MATRIX_URL,
+            json=body,
+            params={"key": API_KEY},
+            headers={"Content-Type": "application/json"},
+        )
         resp.raise_for_status()
         return resp.json()
 
 
+def parse_response(data: dict, origins: list[dict], destinations: list[dict]) -> list[tuple]:
+    """
+    TomTom v2 returns a flat 'data' array. Each element has:
+      - originIndex / destinationIndex
+      - routeSummary.lengthInMeters
+      - routeSummary.travelTimeInSeconds     (includes live traffic)
+      - routeSummary.trafficDelayInSeconds    (extra delay from traffic)
+    """
+    now = datetime.now(timezone.utc)
+    day_of_week = now.strftime("%A")
+    hour = now.hour
+
+    rows = []
+    for cell in data.get("data", []):
+        if "routeSummary" not in cell:
+            continue
+
+        oi = cell["originIndex"]
+        di = cell["destinationIndex"]
+        origin = origins[oi]
+        dest = destinations[di]
+
+        if origin["name"] == dest["name"]:
+            continue
+
+        summary = cell["routeSummary"]
+        distance_m = summary["lengthInMeters"]
+        travel_time_s = summary["travelTimeInSeconds"]
+        traffic_delay_s = summary.get("trafficDelayInSeconds", 0)
+        base_duration_s = travel_time_s - traffic_delay_s
+
+        rows.append((
+            now, day_of_week, hour,
+            origin["name"], origin["lat"], origin["lng"],
+            dest["name"], dest["lat"], dest["lng"],
+            distance_m, base_duration_s, travel_time_s,
+        ))
+    return rows
+
+
 def collect():
     if not API_KEY:
-        print("ERROR: GOOGLE_MAPS_API_KEY not set in .env")
+        print("ERROR: TOMTOM_API_KEY not set in .env")
         sys.exit(1)
     if not DATABASE_URL:
         print("ERROR: COLLECTOR_DATABASE_URL not set in .env")
@@ -97,11 +150,6 @@ def collect():
 
     conn = get_db()
     ensure_table(conn)
-
-    now = datetime.now(timezone.utc)
-    timestamp = now
-    day_of_week = now.strftime("%A")
-    hour = now.hour
 
     locations = KERALA_LOCATIONS
     total_rows = 0
@@ -112,39 +160,21 @@ def collect():
 
         try:
             data = query_batch(origins, locations)
+        except httpx.HTTPStatusError as e:
+            print(f"ERROR batch {batch_start}: {e.response.status_code} {e.response.text[:300]}")
+            errors += 1
+            continue
         except Exception as e:
-            print(f"ERROR querying batch starting at {batch_start}: {e}")
+            print(f"ERROR batch {batch_start}: {e}")
             errors += 1
             continue
 
-        if data.get("status") != "OK":
-            print(f"API error: {data.get('status')} — {data.get('error_message', '')}")
+        if "detailedError" in data:
+            print(f"API error: {data['detailedError']}")
             errors += 1
             continue
 
-        rows = []
-        for i, row in enumerate(data["rows"]):
-            origin = origins[i]
-            for j, element in enumerate(row["elements"]):
-                dest = locations[j]
-
-                if origin["name"] == dest["name"]:
-                    continue
-                if element.get("status") != "OK":
-                    continue
-
-                distance_m = element["distance"]["value"]
-                duration_s = element["duration"]["value"]
-                duration_traffic_s = element.get("duration_in_traffic", {}).get(
-                    "value", duration_s
-                )
-
-                rows.append((
-                    timestamp, day_of_week, hour,
-                    origin["name"], origin["lat"], origin["lng"],
-                    dest["name"], dest["lat"], dest["lng"],
-                    distance_m, duration_s, duration_traffic_s,
-                ))
+        rows = parse_response(data, origins, locations)
 
         try:
             with conn.cursor() as cur:
@@ -159,6 +189,7 @@ def collect():
         time.sleep(1)
 
     conn.close()
+    now = datetime.now(timezone.utc)
     print(f"[{now.isoformat()}] Collected {total_rows} rows, {errors} batch errors")
 
 
